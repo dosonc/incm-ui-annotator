@@ -58,6 +58,19 @@ if not pages:
 
 selected_page = st.sidebar.selectbox("Select Page", options=pages, index=0)
 
+# Initialize bbox_num in session state if not exists
+if 'bbox_num' not in st.session_state:
+    st.session_state.bbox_num = 1
+
+# Track current page to reset bbox_num when page changes
+if 'current_page' not in st.session_state:
+    st.session_state.current_page = selected_page
+
+# Reset bbox_num to 1 when document or page changes
+if st.session_state.current_page != selected_page:
+    st.session_state.bbox_num = 1
+    st.session_state.current_page = selected_page
+
 # Fixed settings to match OCR processing (144 DPI)
 target_dpi = 144
 offset_x = 0
@@ -65,6 +78,12 @@ offset_y = 0
 
 # Get bounding boxes for selected page
 bboxes_data = parsed_data[selected_page]
+
+# Validate and clamp bbox_num to valid range for current page
+if st.session_state.bbox_num > len(bboxes_data):
+    st.session_state.bbox_num = len(bboxes_data)
+elif st.session_state.bbox_num < 1:
+    st.session_state.bbox_num = 1
 
 # Load PDF page as image
 try:
@@ -108,10 +127,6 @@ try:
 except Exception as e:
     st.error(f"Error loading PDF: {e}")
     st.stop()
-
-# Initialize bbox_num in session state if not exists
-if 'bbox_num' not in st.session_state:
-    st.session_state.bbox_num = 1
 
 # Get the current bounding box coordinates
 current_bbox_num = st.session_state.bbox_num
@@ -202,6 +217,7 @@ with col2:
     """, unsafe_allow_html=True)
     
     # Bounding box number selection
+    total_boxes = len(bboxes_data)
     st.write("**Bounding Box Number**")
     bbox_num = st.number_input(
         "",
@@ -209,27 +225,32 @@ with col2:
         max_value=len(bboxes_data),
         value=st.session_state.bbox_num,
         step=1,
-        key="bbox_input",
+        key=f"bbox_input_{selected_page}",
         label_visibility="collapsed"
     )
+    # Show counter with current and total
+    st.caption(f"Box {bbox_num} of {total_boxes}")
     # Update session state when user changes the input
     if bbox_num != st.session_state.bbox_num:
         st.session_state.bbox_num = bbox_num
         st.rerun()
     
-    # Get the text for selected bounding box - use current session state value
-    current_bbox_num = st.session_state.bbox_num
-    selected_bbox_text = bboxes_data[current_bbox_num - 1][1] if current_bbox_num <= len(bboxes_data) else ""
+    # Get the text for selected bounding box - use the bbox_num from input to ensure it matches
+    # Make sure we're using the current page's bboxes_data and valid bbox_num
+    selected_bbox_text = ""
+    if 1 <= bbox_num <= len(bboxes_data):
+        selected_bbox_text = bboxes_data[bbox_num - 1][1]
     
-    # Form for error submission
-    with st.form("error_form", clear_on_submit=True):
+    # Form for error submission - include page in key to reset on page change
+    with st.form(f"error_form_{selected_page}", clear_on_submit=True):
         # Obtained text (non-editable) - use the current bbox text
+        # Include page number in key to ensure it refreshes when page changes
         st.text_area(
             "Obtained text",
             value=selected_bbox_text,
             height=150,
             disabled=True,
-            key=f"obtained_text_{current_bbox_num}"
+            key=f"obtained_text_{selected_page}_{bbox_num}"
         )
         
         # Ground truth (editable)
@@ -255,7 +276,7 @@ with col2:
                 insert_error(
                     document_name=document_name,
                     page_number=selected_page,
-                    bbox_number=st.session_state.bbox_num,
+                    bbox_number=bbox_num,
                     text_with_error=selected_bbox_text,
                     ground_truth=ground_truth,
                     error_type=error_type
