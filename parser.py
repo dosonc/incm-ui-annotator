@@ -33,19 +33,25 @@ def parse_mmd_file(mmd_path: str) -> Dict[int, List[Tuple[List[int], str]]]:
                 x1, y1, x2, y2 = map(int, bbox_match.groups())
                 bbox = [x1, y1, x2, y2]
                 
-                # Get the text from the next non-empty line that's not a bbox line
-                text = ""
+                # Collect all text lines until the next bounding box or end
+                text_lines = []
                 j = i + 1
                 while j < len(lines):
                     candidate = lines[j].strip()
-                    if candidate and not candidate.startswith('<|'):
-                        text = candidate
+                    # Stop if we hit another bounding box line (ref or det marker)
+                    if candidate.startswith('<|ref|>') or candidate.startswith('<|det|>'):
                         break
+                    # Collect non-empty text lines
+                    if candidate and not candidate.startswith('<|'):
+                        text_lines.append(candidate)
                     j += 1
+                
+                # Join all text lines with spaces
+                text = ' '.join(text_lines) if text_lines else ""
                 
                 if text:
                     bboxes.append((bbox, text))
-                    i = j + 1
+                    i = j  # Continue from where we stopped (next bbox or end)
                     continue
             
             i += 1
