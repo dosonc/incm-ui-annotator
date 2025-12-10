@@ -5,6 +5,8 @@ import fitz  # PyMuPDF
 from PIL import Image, ImageDraw, ImageFont
 import io
 import base64
+import pandas as pd
+import re as regex_module
 from parser import parse_mmd_file
 from database import init_db, insert_error, get_errors, delete_error
 
@@ -13,6 +15,76 @@ init_db()
 
 # Page config
 st.set_page_config(page_title="OCR Annotation Tool", layout="wide")
+
+# Helper functions for word counting and comparison
+def count_words(text):
+    """Count words in text, handling tables and regular text."""
+    if not text:
+        return 0
+    # Check if it's a table (HTML format)
+    if text.strip().startswith('<table>'):
+        # For tables, extract text from cells and count words
+        cell_texts = regex_module.findall(r'<td>(.*?)</td>', text, regex_module.DOTALL)
+        all_text = ' '.join(cell_texts)
+        # Remove HTML entities and normalize
+        all_text = all_text.strip()
+    else:
+        all_text = text.strip()
+    
+    # Split into words (handle punctuation as word boundaries)
+    # Use \w+ which matches word characters (letters, digits, underscore)
+    words = regex_module.findall(r'\b\w+\b', all_text)
+    return len(words)
+
+def count_differing_words(obtained_text, ground_truth):
+    """Count the number of words that differ between obtained text and ground truth."""
+    if not obtained_text or not ground_truth:
+        return 0
+    
+    # Handle tables - if both are tables, we need to compare cell by cell
+    if obtained_text.strip().startswith('<table>') and ground_truth.strip().startswith('<table>'):
+        # Extract cells from both tables
+        obtained_cells = regex_module.findall(r'<td>(.*?)</td>', obtained_text, regex_module.DOTALL)
+        ground_truth_cells = regex_module.findall(r'<td>(.*?)</td>', ground_truth, regex_module.DOTALL)
+        
+        # Compare corresponding cells
+        differing_words = 0
+        max_len = max(len(obtained_cells), len(ground_truth_cells))
+        for i in range(max_len):
+            obtained_cell = obtained_cells[i].strip() if i < len(obtained_cells) else ""
+            truth_cell = ground_truth_cells[i].strip() if i < len(ground_truth_cells) else ""
+            
+            # Get words from each cell
+            obtained_words = regex_module.findall(r'\b\w+\b', obtained_cell)
+            truth_words = regex_module.findall(r'\b\w+\b', truth_cell)
+            
+            # Count words that differ (using simple alignment)
+            differing_words += abs(len(obtained_words) - len(truth_words))
+            # Also check word-by-word differences (simplified - just count different lengths or positions)
+            min_len = min(len(obtained_words), len(truth_words))
+            for j in range(min_len):
+                if obtained_words[j].lower() != truth_words[j].lower():
+                    differing_words += 1
+        
+        return differing_words
+    else:
+        # Regular text comparison
+        obtained_words = regex_module.findall(r'\b\w+\b', obtained_text)
+        truth_words = regex_module.findall(r'\b\w+\b', ground_truth)
+        
+        # Count differing words using sequence alignment approach
+        # Simple approach: count words in the shorter sequence that don't match
+        differing_words = 0
+        min_len = min(len(obtained_words), len(truth_words))
+        
+        for i in range(min_len):
+            if obtained_words[i].lower() != truth_words[i].lower():
+                differing_words += 1
+        
+        # Add difference in length as additional differing words
+        differing_words += abs(len(obtained_words) - len(truth_words))
+        
+        return differing_words
 
 # Get all document directories
 parsed_docs_dir = Path("parsed_docs")
@@ -29,6 +101,9 @@ selected_dir = st.sidebar.selectbox(
     options=doc_dirs,
     format_func=lambda x: x.name
 )
+
+# Create tabs for Annotation and Statistics
+tab1, tab2 = st.tabs(["📝 Annotation", "📊 Statistics"])
 
 # Find PDF and MMD files
 # Use the regular PDF (not the layouts PDF which has boxes drawn on it)
@@ -178,8 +253,10 @@ if current_bbox:
 else:
     display_img = img
 
-# Main layout - PDF on left, form on right
-col1, col2 = st.columns([1, 1])
+# Annotation tab
+with tab1:
+    # Main layout - PDF on left, form on right
+    col1, col2 = st.columns([1, 1])
 
 with col1:
     st.subheader(f"Page {selected_page} - Bounding Box {current_bbox_num}")
@@ -292,6 +369,159 @@ if page_errors:
         
         if idx < len(page_errors) - 1:
             st.divider()
-else:
-    st.info("No errors submitted for this page yet.")
+    else:
+        st.info("No errors submitted for this page yet.")
+
+# Statistics tab
+with tab2:
+    st.header("Annotation Statistics")
+    
+    # Get all errors
+    all_errors = get_errors()
+    
+    if not all_errors:
+        st.info("No annotations recorded yet.")
+    else:
+        # Overall statistics
+        col1, col2, col3, col4 = st.columns(4)
+        
+        total_errors = len(all_errors)
+        minor_errors = len([e for e in all_errors if e['error_type'] == 'minor'])
+        major_errors = len([e for e in all_errors if e['error_type'] == 'major'])
+        unique_documents = len(set(e['document_name'] for e in all_errors))
+        
+        with col1:
+            st.metric("Total Errors", total_errors)
+        with col2:
+            st.metric("Minor Errors", minor_errors)
+        with col3:
+            st.metric("Major Errors", major_errors)
+        with col4:
+            st.metric("Documents", unique_documents)
+        
+        # Calculate word error statistics
+        with st.spinner("Calculating word error statistics..."):
+            # Get unique document names that have errors
+            documents_with_errors = set(error['document_name'] for error in all_errors)
+            
+            # Count total OCR words only from documents with errors
+            total_ocr_words = 0
+            for doc_name in documents_with_errors:
+                doc_dir = parsed_docs_dir / doc_name
+                if doc_dir.exists() and doc_dir.is_dir():
+                    mmd_file_list = list(doc_dir.glob("DR_*_det.mmd"))
+                    if mmd_file_list:
+                        try:
+                            parsed_doc_data = parse_mmd_file(str(mmd_file_list[0]))
+                            for page_num, bboxes in parsed_doc_data.items():
+                                for bbox, text in bboxes:
+                                    total_ocr_words += count_words(text)
+                        except Exception as e:
+                            st.warning(f"Could not parse {doc_name}: {e}")
+            
+            # Count error words
+            minor_error_words = 0
+            major_error_words = 0
+            total_error_words = 0
+            
+            for error in all_errors:
+                error_word_count = count_differing_words(
+                    error['text_with_error'], 
+                    error['ground_truth']
+                )
+                total_error_words += error_word_count
+                if error['error_type'] == 'minor':
+                    minor_error_words += error_word_count
+                else:
+                    major_error_words += error_word_count
+            
+            # Calculate percentages
+            minor_error_pct = (minor_error_words / total_ocr_words * 100) if total_ocr_words > 0 else 0
+            major_error_pct = (major_error_words / total_ocr_words * 100) if total_ocr_words > 0 else 0
+            total_error_pct = (total_error_words / total_ocr_words * 100) if total_ocr_words > 0 else 0
+        
+        # Word error statistics section
+        st.subheader("Word Error Statistics")
+        col1, col2, col3, col4, col5 = st.columns(5)
+        
+        with col1:
+            st.metric("Total OCR Words", f"{total_ocr_words:,}")
+        with col2:
+            st.metric("Total Error Words", f"{total_error_words:,}", f"{total_error_pct:.3f}%")
+        with col3:
+            st.metric("Minor Error Words", f"{minor_error_words:,}", f"{minor_error_pct:.3f}%")
+        with col4:
+            st.metric("Major Error Words", f"{major_error_words:,}", f"{major_error_pct:.3f}%")
+        with col5:
+            accuracy = (1 - total_error_pct / 100) * 100 if total_ocr_words > 0 else 100
+            st.metric("Accuracy", f"{accuracy:.3f}%")
+        
+        st.divider()
+        
+        # Errors by document
+        st.subheader("Errors by Document")
+        doc_stats = {}
+        for error in all_errors:
+            doc_name = error['document_name']
+            if doc_name not in doc_stats:
+                doc_stats[doc_name] = {'total': 0, 'minor': 0, 'major': 0}
+            doc_stats[doc_name]['total'] += 1
+            doc_stats[doc_name][error['error_type']] += 1
+        
+        # Display as table
+        doc_df = pd.DataFrame([
+            {
+                'Document': doc,
+                'Total': stats['total'],
+                'Minor': stats['minor'],
+                'Major': stats['major']
+            }
+            for doc, stats in sorted(doc_stats.items())
+        ])
+        st.dataframe(doc_df, use_container_width=True, hide_index=True)
+        
+        st.divider()
+        
+        # Errors per page for selected document
+        st.subheader(f"Errors per Page - {selected_dir.name}")
+        doc_errors = [e for e in all_errors if e['document_name'] == selected_dir.name]
+        
+        if doc_errors:
+            page_stats = {}
+            for error in doc_errors:
+                page_num = error['page_number']
+                if page_num not in page_stats:
+                    page_stats[page_num] = {'total': 0, 'minor': 0, 'major': 0}
+                page_stats[page_num]['total'] += 1
+                page_stats[page_num][error['error_type']] += 1
+            
+            page_df = pd.DataFrame([
+                {
+                    'Page': page,
+                    'Total': stats['total'],
+                    'Minor': stats['minor'],
+                    'Major': stats['major']
+                }
+                for page, stats in sorted(page_stats.items())
+            ])
+            st.dataframe(page_df, use_container_width=True, hide_index=True)
+            
+            # Bar chart of errors per page
+            if len(page_df) > 0:
+                st.subheader("Errors per Page (Chart)")
+                st.bar_chart(page_df.set_index('Page')[['Minor', 'Major']], height=400)
+        else:
+            st.info(f"No errors recorded for document {selected_dir.name} yet.")
+        
+        st.divider()
+        
+        # Recent errors
+        st.subheader("Recent Errors")
+        recent_errors = sorted(all_errors, key=lambda x: x['created_at'], reverse=True)[:10]
+        
+        for error in recent_errors:
+            with st.expander(f"{error['document_name']} - Page {error['page_number']}, Box {error['bbox_number']} ({error['error_type']})"):
+                st.write(f"**Text with Error:** {error['text_with_error'][:200]}{'...' if len(error['text_with_error']) > 200 else ''}")
+                st.write(f"**Ground Truth:** {error['ground_truth'][:200]}{'...' if len(error['ground_truth']) > 200 else ''}")
+                st.caption(f"Submitted: {error['created_at']}")
 
