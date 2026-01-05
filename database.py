@@ -80,3 +80,22 @@ def delete_error(error_id: int):
     conn.commit()
     conn.close()
 
+
+def get_ground_truth(document_name: str, page_number: int, bbox_number: int) -> str:
+    """Get ground truth for a specific bbox, if it exists."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    c.execute('''
+        SELECT ground_truth FROM errors 
+        WHERE document_name = ? AND page_number = ? AND bbox_number = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+    ''', (document_name, page_number, bbox_number))
+    
+    row = c.fetchone()
+    conn.close()
+    
+    return row['ground_truth'] if row else ""
+

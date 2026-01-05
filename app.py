@@ -1,126 +1,258 @@
 import streamlit as st
 import streamlit.components.v1 as components
 from pathlib import Path
-import fitz  # PyMuPDF
-from PIL import Image, ImageDraw, ImageFont
-import io
-import base64
+from PIL import Image
 import pandas as pd
-import re as regex_module
+import io
 from parser import parse_mmd_file
 from database import init_db, insert_error, get_errors, delete_error
+from loguru import logger
+import config
+from api_utils import get_openrouter_client, encode_image_to_base64
+from text_utils import is_table, count_words, count_differing_words
+from document_utils import parse_doc_name, get_documents_data
+from image_utils import load_pdf_page_as_image, crop_and_highlight_bbox
+
+# Load environment variables from .env file
 
 # Initialize database
 init_db()
 
 # Page config
-st.set_page_config(page_title="OCR Annotation Tool", layout="wide")
+st.set_page_config(page_title=config.PAGE_TITLE, layout=config.PAGE_LAYOUT)
 
-# Helper functions for word counting and comparison
-def count_words(text):
-    """Count words in text, handling tables and regular text."""
-    if not text:
-        return 0
-    # Check if it's a table (HTML format)
-    if text.strip().startswith('<table>'):
-        # For tables, extract text from cells and count words
-        cell_texts = regex_module.findall(r'<td>(.*?)</td>', text, regex_module.DOTALL)
-        all_text = ' '.join(cell_texts)
-        # Remove HTML entities and normalize
-        all_text = all_text.strip()
-    else:
-        all_text = text.strip()
+# ============================================================================
+# Authentication
+# ============================================================================
+
+def check_password():
+    """Returns `True` if the user had the correct password."""
     
-    # Split into words (handle punctuation as word boundaries)
-    # Use \w+ which matches word characters (letters, digits, underscore)
-    words = regex_module.findall(r'\b\w+\b', all_text)
-    return len(words)
-
-def count_differing_words(obtained_text, ground_truth):
-    """Count the number of words that differ between obtained text and ground truth."""
-    if not obtained_text or not ground_truth:
-        return 0
-    
-    # Handle tables - if both are tables, we need to compare cell by cell
-    if obtained_text.strip().startswith('<table>') and ground_truth.strip().startswith('<table>'):
-        # Extract cells from both tables
-        obtained_cells = regex_module.findall(r'<td>(.*?)</td>', obtained_text, regex_module.DOTALL)
-        ground_truth_cells = regex_module.findall(r'<td>(.*?)</td>', ground_truth, regex_module.DOTALL)
+    # Return True if password is correct
+    if "password_correct" not in st.session_state or not st.session_state["password_correct"]:
+        # Show login form centered
+        col1, col2, col3 = st.columns([1, 2, 1])
         
-        # Compare corresponding cells
-        differing_words = 0
-        max_len = max(len(obtained_cells), len(ground_truth_cells))
-        for i in range(max_len):
-            obtained_cell = obtained_cells[i].strip() if i < len(obtained_cells) else ""
-            truth_cell = ground_truth_cells[i].strip() if i < len(ground_truth_cells) else ""
+        with col2:
+            # Display logos
+            logo_col1, logo_col2 = st.columns(2)
+            try:
+                with logo_col1:
+                    wallis_logo = Image.open("public/konica-logo.png")
+                    # Convert to base64 and embed directly in HTML to bypass Streamlit's media storage
+                    wallis_base64 = encode_image_to_base64(wallis_logo)
+                    st.markdown(
+                        f'<img src="data:image/jpeg;base64,{wallis_base64}" style="width:100%; height:auto;" />',
+                        unsafe_allow_html=True
+                    )
+                with logo_col2:
+                    konica_logo = Image.open("public/wallis-logo.png")
+                    # Convert to base64 and embed directly in HTML to bypass Streamlit's media storage
+                    konica_base64 = encode_image_to_base64(konica_logo)
+                    st.markdown(
+                        f'<img src="data:image/jpeg;base64,{konica_base64}" style="width:100%; height:auto;" />',
+                        unsafe_allow_html=True
+                    )
+            except FileNotFoundError:
+                st.info("Logos não encontrados")
             
-            # Get words from each cell
-            obtained_words = regex_module.findall(r'\b\w+\b', obtained_cell)
-            truth_words = regex_module.findall(r'\b\w+\b', truth_cell)
+            st.markdown("---")
             
-            # Count words that differ (using simple alignment)
-            differing_words += abs(len(obtained_words) - len(truth_words))
-            # Also check word-by-word differences (simplified - just count different lengths or positions)
-            min_len = min(len(obtained_words), len(truth_words))
-            for j in range(min_len):
-                if obtained_words[j].lower() != truth_words[j].lower():
-                    differing_words += 1
+            # Use separate keys for login form to avoid conflicts
+            username = st.text_input("Username", key="login_username")
+            password = st.text_input("Password", type="password", key="login_password")
+            
+            login_button = st.button("Login", type="primary", use_container_width=True)
+            
+            if login_button:
+                logger.info(f"Username: {username}, Password: {password}")
+                logger.info(f"Config.AUTH_USERNAME: {config.AUTH_USERNAME}, Config.AUTH_PASSWORD: {config.AUTH_PASSWORD}")
+                if username == config.AUTH_USERNAME and password == config.AUTH_PASSWORD:
+                    st.session_state["password_correct"] = True
+                    # Clear login form keys
+                    if "login_username" in st.session_state:
+                        del st.session_state["login_username"]
+                    if "login_password" in st.session_state:
+                        del st.session_state["login_password"]
+                    st.rerun()
+                else:
+                    st.session_state["password_correct"] = False
+                    st.error("😕 Username/password incorretos")
+            
+            if "password_correct" in st.session_state and not st.session_state["password_correct"]:
+                st.error("😕 Username/password incorretos")
         
-        return differing_words
+        return False
     else:
-        # Regular text comparison
-        obtained_words = regex_module.findall(r'\b\w+\b', obtained_text)
-        truth_words = regex_module.findall(r'\b\w+\b', ground_truth)
-        
-        # Count differing words using sequence alignment approach
-        # Simple approach: count words in the shorter sequence that don't match
-        differing_words = 0
-        min_len = min(len(obtained_words), len(truth_words))
-        
-        for i in range(min_len):
-            if obtained_words[i].lower() != truth_words[i].lower():
-                differing_words += 1
-        
-        # Add difference in length as additional differing words
-        differing_words += abs(len(obtained_words) - len(truth_words))
-        
-        return differing_words
+        # Password correct
+        return True
 
-# Get all document directories
-parsed_docs_dir = Path("parsed_docs")
-doc_dirs = sorted([d for d in parsed_docs_dir.iterdir() if d.is_dir()])
+# Check authentication before showing the app
+if not check_password():
+    st.stop()  # Do not continue if password is not correct
 
-if not doc_dirs:
-    st.error("No document directories found in parsed_docs/")
+
+# Logout button in sidebar
+if st.sidebar.button("🚪 Logout", use_container_width=True):
+    # Clear authentication
+    if "password_correct" in st.session_state:
+        del st.session_state["password_correct"]
+    if "username" in st.session_state:
+        del st.session_state["username"]
+    st.rerun()
+
+if "last_bbox_id" not in st.session_state:
+    st.session_state.last_bbox_id = None
+
+if "temp_text" not in st.session_state:
+    st.session_state.temp_text = None
+
+if "button_accept" not in st.session_state:
+    st.session_state.button_accept = None
+if "previous_year" not in st.session_state:
+    st.session_state.previous_year = None
+if "previous_month" not in st.session_state:
+    st.session_state.previous_month = None
+if "previous_day" not in st.session_state:
+    st.session_state.previous_day = None
+if "previous_page" not in st.session_state:
+    st.session_state.previous_page = None
+
+
+# Text processing functions are now imported from text_utils
+
+# Get all documents from year folders
+parsed_docs_dir = config.PARSED_DOCS_DIR
+year_dirs = sorted([d for d in parsed_docs_dir.iterdir() if d.is_dir()])
+
+if not year_dirs:
+    st.error("Nenhum diretório de documentos encontrado em parsed_docs/")
     st.stop()
+
+# Extract all documents from year folders
+documents_data = get_documents_data()
+
+if not documents_data:
+    st.error("Nenhum documento válido encontrado")
+    st.stop()
+
+# Get unique years, months, days
+all_years = sorted(set(d['year'] for d in documents_data))
+all_months = sorted(set(d['month'] for d in documents_data))
+all_days = sorted(set(d['day'] for d in documents_data))
+
+# Navigation buttons in sidebar
+if "current_view" not in st.session_state:
+    st.session_state.current_view = "anotacao"
+
+nav_anotacao = st.sidebar.button("📝 Anotação", use_container_width=True, type="primary" if st.session_state.current_view == "anotacao" else "secondary", key="nav_anotacao")
+if nav_anotacao:
+    st.session_state.current_view = "anotacao"
+    st.rerun()
+
+nav_estatisticas = st.sidebar.button("📊 Estatísticas", use_container_width=True, type="primary" if st.session_state.current_view == "estatisticas" else "secondary", key="nav_estatisticas")
+if nav_estatisticas:
+    st.session_state.current_view = "estatisticas"
+    st.rerun()
+
+st.sidebar.markdown("---")
 
 # Sidebar for document selection
-st.sidebar.title("Document Selection")
-selected_dir = st.sidebar.selectbox(
-    "Select Document",
-    options=doc_dirs,
-    format_func=lambda x: x.name
+st.sidebar.title("Diário do Governo")
+
+# Initialize session state for date selection
+if 'selected_year' not in st.session_state:
+    st.session_state.selected_year = all_years[0] if all_years else None
+if 'selected_month' not in st.session_state:
+    st.session_state.selected_month = all_months[0] if all_months else None
+if 'selected_day' not in st.session_state:
+    st.session_state.selected_day = all_days[0] if all_days else None
+
+# Year dropdown
+selected_year = st.sidebar.selectbox(
+    "Ano",
+    options=all_years,
+    index=all_years.index(st.session_state.selected_year) if st.session_state.selected_year in all_years else 0,
+    key="year_select"
 )
 
-# Create tabs for Annotation and Statistics
-tab1, tab2 = st.tabs(["📝 Annotation", "📊 Statistics"])
+# Filter documents by year
+filtered_by_year = [d for d in documents_data if d['year'] == selected_year]
+available_months = sorted(set(d['month'] for d in filtered_by_year))
 
-# Find PDF and MMD files
-# Use the regular PDF (not the layouts PDF which has boxes drawn on it)
-pdf_files = [f for f in selected_dir.glob("DR_*.pdf") if "_layouts" not in f.name]
-mmd_files = list(selected_dir.glob("DR_*_det.mmd"))
+# Month dropdown with month names
+if available_months:
+    # Update selected_month if it's not available for current year
+    if st.session_state.selected_month not in available_months:
+        st.session_state.selected_month = available_months[0]
+    
+    selected_month = st.sidebar.selectbox(
+        "Mês",
+        options=available_months,
+        index=available_months.index(st.session_state.selected_month) if st.session_state.selected_month in available_months else 0,
+        format_func=lambda x: config.MONTH_NAMES.get(x, str(x)),
+        key="month_select"
+    )
+else:
+    selected_month = None
+    st.sidebar.warning("Nenhum mês disponível para o ano selecionado")
 
-if not pdf_files or not mmd_files:
-    st.error(f"Missing PDF or MMD files in {selected_dir.name}")
+# Filter documents by year and month
+if selected_month:
+    filtered_by_month = [d for d in filtered_by_year if d['month'] == selected_month]
+    available_days = sorted(set(d['day'] for d in filtered_by_month))
+    
+    # Day dropdown
+    if available_days:
+        # Update selected_day if it's not available for current month
+        if st.session_state.selected_day not in available_days:
+            st.session_state.selected_day = available_days[0]
+        
+        selected_day = st.sidebar.selectbox(
+            "Dia",
+            options=available_days,
+            index=available_days.index(st.session_state.selected_day) if st.session_state.selected_day in available_days else 0,
+            key="day_select"
+        )
+    else:
+        selected_day = None
+        st.sidebar.warning("Nenhum dia disponível para o mês selecionado")
+else:
+    selected_day = None
+
+# Find the matching document
+selected_doc = None
+if selected_year and selected_month and selected_day:
+    matching_docs = [d for d in documents_data if d['year'] == selected_year and d['month'] == selected_month and d['day'] == selected_day]
+    if matching_docs:
+        selected_doc = matching_docs[0]
+        selected_dir = selected_doc['path']  # Year folder
+        document_name = selected_doc['name']  # Document name (DR_DD_MM_YYYY)
+        # For database operations, use the year (to match existing database format)
+        document_name_db = str(selected_year)
+        # Update session state
+        st.session_state.selected_year = selected_year
+        st.session_state.selected_month = selected_month
+        st.session_state.selected_day = selected_day
+    else:
+        st.sidebar.error("Documento não encontrado")
+        st.stop()
+else:
+    st.sidebar.error("Selecione ano, mês e dia")
     st.stop()
 
-pdf_path = pdf_files[0]
-mmd_path = mmd_files[0]
-document_name = selected_dir.name
+# Find PDF and MMD files using the document name
+# Use the regular PDF (not the layouts PDF which has boxes drawn on it)
+pdf_path = selected_dir / f"{document_name}.pdf"
+mmd_path = selected_dir / f"{document_name}_det.mmd"
+
+if not pdf_path.exists() or not mmd_path.exists():
+    st.error(f"Ficheiros PDF ou MMD em falta para {document_name}")
+    st.stop()
 
 # Parse MMD file
 if 'parsed_data' not in st.session_state or st.session_state.get('current_doc') != document_name:
-    with st.spinner("Parsing MMD file..."):
+    with st.spinner("A processar ficheiro MMD..."):
         st.session_state.parsed_data = parse_mmd_file(str(mmd_path))
         st.session_state.current_doc = document_name
 
@@ -129,258 +261,411 @@ parsed_data = st.session_state.parsed_data
 # Page selection
 pages = sorted(parsed_data.keys())
 if not pages:
-    st.error("No pages found in MMD file")
+    st.error("Nenhuma página encontrada no ficheiro MMD")
     st.stop()
 
-selected_page = st.sidebar.selectbox("Select Page", options=pages, index=0)
+# Get current page index or default to 0
+current_page_index = 0
+if st.session_state.previous_page and st.session_state.previous_page in pages:
+    current_page_index = pages.index(st.session_state.previous_page)
 
-# Fixed settings to match OCR processing (144 DPI)
-target_dpi = 144
-offset_x = 0
-offset_y = 0
+selected_page = st.sidebar.selectbox(
+    "Página",
+    options=pages,
+    index=current_page_index,
+    key="page_select"
+)
+
+# Initialize previous values if not set (before checking for changes)
+if st.session_state.previous_year is None:
+    st.session_state.previous_year = selected_year
+if st.session_state.previous_month is None:
+    st.session_state.previous_month = selected_month
+if st.session_state.previous_day is None:
+    st.session_state.previous_day = selected_day
+
+# Check if sidebar selections changed and reset bbox if needed
+sidebar_changed = (
+    st.session_state.previous_year != selected_year or
+    st.session_state.previous_month != selected_month or
+    st.session_state.previous_day != selected_day or
+    st.session_state.previous_page != selected_page
+)
+
+
+if sidebar_changed:
+    logger.info("Sidebar changed")
+    # Reset bbox to 1 and clear text state
+    st.session_state.bbox_num = 1
+    st.session_state.temp_text = None
+    if "ground_truth" in st.session_state:
+        st.session_state["ground_truth"] = None
+    st.session_state.last_bbox_id = None
+    
+    # Clear all per-bbox session state to ensure text boxes update correctly
+    keys_to_clear = [key for key in st.session_state.keys() if any(
+        key.startswith(prefix) for prefix in [
+            "llm_corrected_text_",
+            "combined_correction_",
+            "use_llm_suggestion_",
+            "use_combined_suggestion_",
+            "obtained_text_",
+            "ground_truth_",
+            "ferramentas_correcao_",
+            "checkbox_inteligente_",
+            "checkbox_regras_",
+            "apply_corrections_",
+            "accept_obtained_text_",
+            "use_llm_text_",
+            "llm_corrected_display_",
+            "combined_correction_display_",
+            "submit_error_"
+        ]
+    )]
+    for key in keys_to_clear:
+        del st.session_state[key]
+    
+    # Update previous values
+    st.session_state.previous_year = selected_year
+    st.session_state.previous_month = selected_month
+    st.session_state.previous_day = selected_day
+    st.session_state.previous_page = selected_page
+    logger.info("Sidebar changed")
 
 # Get bounding boxes for selected page
 bboxes_data = parsed_data[selected_page]
-
-# Load PDF page as image
-try:
-    pdf_doc = fitz.open(str(pdf_path))
-    if selected_page > len(pdf_doc):
-        st.error(f"Page {selected_page} not found in PDF")
-        st.stop()
-    
-    page = pdf_doc[selected_page - 1]  # PDF pages are 0-indexed
-    page_rect = page.rect
-    
-    # Get the page dimensions in points
-    page_width_pt = page_rect.width
-    page_height_pt = page_rect.height
-    
-    # Calculate scale factor based on target DPI
-    # PyMuPDF default is 72 DPI, so scale_factor = target_dpi / 72
-    # Match the exact processing method: zoom = dpi / 72.0
-    zoom = target_dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    # Use alpha=False to match the original processing
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    
-    # Get actual rendered dimensions
-    rendered_width = pix.width
-    rendered_height = pix.height
-    
-    # Calculate the actual scale factor based on rendered vs PDF dimensions
-    # This accounts for any DPI differences
-    actual_scale_x = rendered_width / page_width_pt
-    actual_scale_y = rendered_height / page_height_pt
-    
-    img_data = pix.tobytes("png")
-    img = Image.open(io.BytesIO(img_data))
-    
-    # Get image dimensions
-    img_width, img_height = img.size
-    
-    pdf_doc.close()
-    
-except Exception as e:
-    st.error(f"Error loading PDF: {e}")
-    st.stop()
 
 # Initialize bbox_num in session state if not exists
 if 'bbox_num' not in st.session_state:
     st.session_state.bbox_num = 1
 
-# Get the current bounding box coordinates
-current_bbox_num = st.session_state.bbox_num
-current_bbox, _ = bboxes_data[current_bbox_num - 1] if current_bbox_num <= len(bboxes_data) else (None, None)
+# Bounding box number input in sidebar
+logger.info(f"Bbox num: {st.session_state.bbox_num}")
+st.sidebar.number_input(
+    "Caixa",
+    min_value=1,
+    max_value=len(bboxes_data),
+    step=1,
+    key="bbox_num"
+)
+logger.info(f"Bbox num after input: {st.session_state.bbox_num}")
 
-# Crop image to show only the selected bounding box
-if current_bbox:
-    x1, y1, x2, y2 = current_bbox
-    
-    # Check if coordinates are normalized (0-999 range) or already in pixels
-    max_coord = max(x1, y1, x2, y2)
-    
-    if max_coord <= 999:
-        # Coordinates are normalized to 0-999, scale to image dimensions
-        x1_scaled = int(x1 / 999 * img_width) + offset_x
-        y1_scaled = int(y1 / 999 * img_height) + offset_y
-        x2_scaled = int(x2 / 999 * img_width) + offset_x
-        y2_scaled = int(y2 / 999 * img_height) + offset_y
+# Load PDF page as image
+try:
+    img, img_metadata = load_pdf_page_as_image(pdf_path, selected_page)
+except Exception as e:
+    st.error(f"Erro ao carregar PDF: {e}")
+    st.stop()
+
+# Check for navigation actions that need to happen before widgets are created
+# This prevents the "cannot modify after widget instantiated" error
+if 'next_bbox' in st.session_state and st.session_state.next_bbox:
+    if st.session_state.bbox_num < len(bboxes_data):
+        st.session_state.bbox_num += 1
+    st.session_state.next_bbox = False
+
+# Annotation view
+if st.session_state.current_view == "anotacao":
+    # Get the current bounding box coordinates AFTER the widget has processed the value
+    current_bbox_num = st.session_state.bbox_num
+    current_bbox, _ = bboxes_data[current_bbox_num - 1] if current_bbox_num <= len(bboxes_data) else (None, None)
+
+    # Crop image to show only the selected bounding box
+    if current_bbox:
+        display_img = crop_and_highlight_bbox(img, current_bbox, img_metadata)
     else:
-        # Coordinates are already in pixel space
-        actual_scale_x = rendered_width / page_width_pt
-        actual_scale_y = rendered_height / page_height_pt
-        x1_scaled = int(x1 * actual_scale_x) + offset_x
-        y1_scaled = int(y1 * actual_scale_y) + offset_y
-        x2_scaled = int(x2 * actual_scale_x) + offset_x
-        y2_scaled = int(y2 * actual_scale_y) + offset_y
-    
-    # Ensure coordinates are within image bounds
-    x1_scaled = max(0, min(x1_scaled, img_width))
-    y1_scaled = max(0, min(y1_scaled, img_height))
-    x2_scaled = max(0, min(x2_scaled, img_width))
-    y2_scaled = max(0, min(y2_scaled, img_height))
-    
-    # Crop the image to the bounding box with some padding
-    padding = 20
-    crop_x1 = max(0, x1_scaled - padding)
-    crop_y1 = max(0, y1_scaled - padding)
-    crop_x2 = min(img_width, x2_scaled + padding)
-    crop_y2 = min(img_height, y2_scaled + padding)
-    
-    # Crop the image
-    cropped_img = img.crop((crop_x1, crop_y1, crop_x2, crop_y2))
-    
-    # Adjust coordinates relative to crop
-    box_x1 = x1_scaled - crop_x1
-    box_y1 = y1_scaled - crop_y1
-    box_x2 = x2_scaled - crop_x1
-    box_y2 = y2_scaled - crop_y1
-    
-    # Create a transparent overlay for the bounding box
-    overlay = Image.new('RGBA', cropped_img.size, (0, 0, 0, 0))
-    draw_overlay = ImageDraw.Draw(overlay)
-    
-    # Draw semi-transparent light blue rectangle
-    # Light blue with transparency: (173, 216, 230, 100) - light blue with ~40% opacity
-    draw_overlay.rectangle([box_x1, box_y1, box_x2, box_y2], 
-                          fill=(173, 216, 230, 100), outline=None)
-    
-    # Composite the overlay onto the cropped image
-    cropped_img = Image.alpha_composite(cropped_img.convert('RGBA'), overlay).convert('RGB')
-    
-    display_img = cropped_img
-else:
-    display_img = img
-
-# Annotation tab
-with tab1:
-    # Main layout - PDF on left, form on right
-    col1, col2 = st.columns([1, 1])
-
-with col1:
-    st.subheader(f"Page {selected_page} - Bounding Box {current_bbox_num}")
-    st.image(display_img, use_container_width=True)
-
-with col2:
-    st.subheader("Submit Error")
-    
-    # Bounding box number selection with custom +/- buttons
-    st.write("**Bounding Box Number**")
-    bbox_col1, bbox_col2, bbox_col3 = st.columns([1, 3, 1])
-    
-    with bbox_col1:
-        decrement_clicked = st.button("◄", key="decrement_bbox", use_container_width=True)
-        if decrement_clicked:
-            if st.session_state.bbox_num > 1:
-                st.session_state.bbox_num -= 1
-            st.rerun()
-    
-    with bbox_col2:
-        bbox_num = st.number_input(
-            "",
-            min_value=1,
-            max_value=len(bboxes_data),
-            value=st.session_state.bbox_num,
-            step=1,
-            key="bbox_input",
-            label_visibility="collapsed"
-        )
-        # Update session state when user changes the input
-        if bbox_num != st.session_state.bbox_num:
-            st.session_state.bbox_num = bbox_num
-            st.rerun()
-    
-    with bbox_col3:
-        increment_clicked = st.button("►", key="increment_bbox", use_container_width=True)
-        if increment_clicked:
-            if st.session_state.bbox_num < len(bboxes_data):
-                st.session_state.bbox_num += 1
-            st.rerun()
+        display_img = img
     
     # Get the text for selected bounding box - use current session state value
-    current_bbox_num = st.session_state.bbox_num
     selected_bbox_text = bboxes_data[current_bbox_num - 1][1] if current_bbox_num <= len(bboxes_data) else ""
+    logger.info(f"Selected bbox text: {selected_bbox_text}")
+    # Check if this is a table
+    is_table_bbox = is_table(selected_bbox_text)
     
-    # Form for error submission
-    with st.form("error_form", clear_on_submit=True):
-        # Obtained text (non-editable) - use the current bbox text
-        st.text_area(
-            "Obtained text",
-            value=selected_bbox_text,
-            height=150,
-            disabled=True,
-            key=f"obtained_text_{current_bbox_num}"
+    # Initialize ground_truth in session state if needed or update when bbox changes
+    if st.session_state.last_bbox_id != current_bbox_num:
+        st.session_state["ground_truth"] = selected_bbox_text
+        st.session_state.last_bbox_id = current_bbox_num
+        # Reset temp_text when changing bbox (LLM results are kept per bbox)
+        st.session_state.temp_text = None
+
+    # Main section - Image on left, text boxes on right
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        # Get bounding box coordinates
+        if current_bbox:
+            x_coord, y_coord = current_bbox[0], current_bbox[1]
+            st.subheader(f"Pagina {selected_page} - Caixa {current_bbox_num} - X: {x_coord} Y: {y_coord}")
+        else:
+            st.subheader(f"Pagina {selected_page} - Caixa {current_bbox_num}")
+        # Convert PIL Image to base64 and embed directly in HTML to bypass Streamlit's media storage
+        img_base64 = encode_image_to_base64(display_img)
+        st.markdown(
+            f'<img src="data:image/jpeg;base64,{img_base64}" style="width:100%; height:auto;" />',
+            unsafe_allow_html=True
         )
-        
-        # Ground truth (editable)
-        ground_truth = st.text_area(
-            "Ground Truth",
-            height=150,
-            key="ground_truth"
-        )
-        
-        # Error type
-        error_type = st.selectbox(
-            "Error Type",
-            options=["minor", "major"],
-            key="error_type"
-        )
-        
-        submitted = st.form_submit_button("Submit Error", type="primary")
-        
-        if submitted:
-            if not ground_truth.strip():
-                st.error("Please provide the ground truth text")
-            else:
-                insert_error(
-                    document_name=document_name,
-                    page_number=selected_page,
-                    bbox_number=st.session_state.bbox_num,
-                    text_with_error=selected_bbox_text,
-                    ground_truth=ground_truth,
-                    error_type=error_type
+
+    with col2:
+        # If it's a table, only show the image (already displayed in col1)
+        if is_table_bbox:
+            pass
+        else:
+            # Obtained text (non-editable) - only for non-tables
+            st.text_area(
+                "Texto obtido",
+                value=selected_bbox_text,
+                height=150,
+                disabled=True)
+                #key=f"obtained_text_{current_bbox_num}")
+            
+            if st.button("Aceitar texto obtido", key=f"accept_obtained_text_{current_bbox_num}", type="secondary", width='stretch'):
+                # Move to next box
+                if st.session_state.bbox_num < len(bboxes_data):
+                    st.session_state.next_bbox = True
+                    logger.info(f"Moving to next bbox")
+                    st.rerun()
+                else:
+                    st.info("Já está na última caixa delimitadora")
+            
+            # Ferramentas section after "Texto obtido" (outside form)
+            st.write("**Ferramentas**")
+            
+            # Initialize checkboxes state
+            if f"ferramentas_correcao_inteligente_{current_bbox_num}" not in st.session_state:
+                st.session_state[f"ferramentas_correcao_inteligente_{current_bbox_num}"] = False
+            if f"ferramentas_correcao_regras_{current_bbox_num}" not in st.session_state:
+                st.session_state[f"ferramentas_correcao_regras_{current_bbox_num}"] = False
+            
+            # Ferramentas in one row: checkboxes and apply button
+            ferramentas_col1, ferramentas_col2, ferramentas_col3 = st.columns([2, 2, 2])
+            
+            with ferramentas_col1:
+                correcao_inteligente = st.checkbox(
+                    "🤖 Inteligente",
+                    value=st.session_state[f"ferramentas_correcao_inteligente_{current_bbox_num}"],
+                    key=f"checkbox_inteligente_{current_bbox_num}"
                 )
-                st.success("Error submitted successfully!")
-                st.rerun()
+            
+            with ferramentas_col2:
+                correcao_regras = st.checkbox(
+                    "📝 Regras",
+                    value=st.session_state[f"ferramentas_correcao_regras_{current_bbox_num}"],
+                    key=f"checkbox_regras_{current_bbox_num}"
+                )
+            
+            with ferramentas_col3:
+                # Apply button
+                apply_button = st.button("Aplicar Correções", type="primary", width='stretch', key=f"apply_corrections_{current_bbox_num}")
+            
+            # Update session state
+            st.session_state[f"ferramentas_correcao_inteligente_{current_bbox_num}"] = correcao_inteligente
+            st.session_state[f"ferramentas_correcao_regras_{current_bbox_num}"] = correcao_regras
+            
+            if apply_button:
+                if correcao_inteligente or correcao_regras:
+                    # Start with current text
+                    if st.session_state.temp_text is not None:
+                        working_text = st.session_state.temp_text
+                    else:
+                        working_text = st.session_state["ground_truth"]
+                    
+                    # Apply intelligent correction first if selected
+                    if correcao_inteligente:
+                        client = get_openrouter_client()
+                        if client is not None:
+                            try:
+                                # Convert image to base64
+                                img_base64 = encode_image_to_base64(display_img)
+                                
+                                with st.spinner("A processar..."):
+                                    # Call OpenRouter API with image (using vision model)
+                                    response = client.chat.completions.create(
+                                        model=config.DEFAULT_VISION_MODEL,
+                                        messages=[
+                                            {
+                                                "role": "user",
+                                                "content": [
+                                                    {
+                                                        "type": "text",
+                                                        "text": config.PROMPT_IMAGE
+                                                    },
+                                                    {
+                                                        "type": "image_url",
+                                                        "image_url": {
+                                                            "url": f"data:image/jpeg;base64,{img_base64}"
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        ],
+                                        temperature=config.LLM_TEMPERATURE,
+                                    )
+                                    
+                                    # Extract text from response
+                                    llm_corrected_text = response.choices[0].message.content.strip()
+                                    logger.info(f"Texto obtido com LLM: {llm_corrected_text}")
+                                    
+                                    # Store in session state
+                                    st.session_state[f"llm_corrected_text_{current_bbox_num}"] = llm_corrected_text
+                                    
+                                    # Use corrected text for further processing
+                                    working_text = llm_corrected_text
+                            except Exception as e:
+                                st.error(f"Erro ao processar imagem com LLM: {str(e)}")
+                                logger.error(f"Erro ao processar imagem com LLM: {str(e)}")
+                                st.exception(e)
+                        else:
+                            st.error("OpenRouter API key não encontrada")
+                    
+                    # Apply rules correction if selected
+                    if correcao_regras:
+                        for old, new in config.RULES_DICT.items():
+                            working_text = working_text.replace(old, new)
+                        logger.info(f"Working text after rule correction: {working_text}")
+                    
+                    # Store the combined correction result for display in "Sugestão de Correção"
+                    st.session_state[f"combined_correction_{current_bbox_num}"] = working_text
+                    
+                    # Update temp_text with the corrected result
+                    st.session_state.temp_text = working_text
+                    st.success("Correções aplicadas com sucesso!")
+                    st.rerun()
+                else:
+                    st.warning("Por favor selecione pelo menos uma ferramenta de correção")
+            
+            # Display combined correction suggestion if available
+            combined_correction_key = f"combined_correction_{current_bbox_num}"
+            
+            if combined_correction_key in st.session_state and st.session_state[combined_correction_key]:
+                
+                # Combined Correction Suggestion Text box (LLM + Rules or either one)
+                st.text_area(
+                    "Sugestão de Correção",
+                    value=st.session_state[combined_correction_key],
+                    height=150,
+                    disabled=True,
+                    key=f"combined_correction_display_{current_bbox_num}"
+                )
+                
+                # Button to use combined correction suggestion
+                if st.button("Aceitar sugestão de correção", key=f"use_combined_suggestion_{current_bbox_num}", type="primary"):
+                    # Update temp_text with the combined correction
+                    st.session_state.temp_text = st.session_state[combined_correction_key]
+                    st.success("Sugestão copiada para 'Texto Correto'!")
+                    # Move to next box
+                    if st.session_state.bbox_num < len(bboxes_data):
+                        st.session_state.next_bbox = True
+                    else:
+                        st.info("Já está na última caixa delimitadora")
+                    st.rerun()
 
-# Show existing errors for this document/page
-st.divider()
-st.subheader("Existing Errors")
+            # Form for error submission
+            with st.form("error_form", clear_on_submit=True):
+                # Ground truth (editable) - use session state value only
+                # Pre-fill with corrected text if available
+                if st.session_state.temp_text is not None:
+                    ground_truth_default = st.session_state.temp_text
+                else:
+                    ground_truth_default = selected_bbox_text
 
-errors = get_errors(document_name)
-page_errors = [e for e in errors if e['page_number'] == selected_page]
+                ground_truth = st.text_area(
+                    "Texto Corrigido",
+                    value=ground_truth_default, 
+                    height=150,
+                    disabled=False,
+                    #key=f"ground_truth_{current_bbox_num}")
+                )
+                # Error type and Error submission in same row
+                action_col1, action_col2 = st.columns([2, 2])
+                
+                with action_col1:
+                    # Error type
+                    error_type = st.selectbox(
+                        "Tipo de Erro",
+                        options=config.ERROR_TYPES,
+                        format_func=lambda x: config.ERROR_TYPE_LABELS.get(x, x),
+                        key="error_type"
+                    )
+                
+                with action_col2:
+                    # Red "Submeter Erro" button
+                    st.markdown("""
+                        <style>
+                        .submit-error-btn > button {
+                            background-color: #dc3545 !important;
+                            color: white !important;
+                            border-radius: 8px !important;
+                            padding: 0.5rem 2rem !important;
+                            font-weight: bold !important;
+                            width: 100% !important;
+                        }
+                        .submit-error-btn > button:hover {
+                            background-color: #c82333 !important;
+                            box-shadow: 0 4px 8px rgba(220, 53, 69, 0.3) !important;
+                        }
+                        </style>
+                    """, unsafe_allow_html=True)
+                    
+                    st.markdown('<div class="submit-error-btn">', unsafe_allow_html=True)
+                    submitted = st.form_submit_button("Submeter Erro", width='stretch', key=f"submit_error_{current_bbox_num}")
+                    st.markdown('</div>', unsafe_allow_html=True)
+                
+                # Handle submit error button
+                if submitted:
+                    if not ground_truth.strip():
+                        st.error("Por favor forneça o texto correto")
+                    else:
+                        insert_error(
+                            document_name=document_name_db,  # Use year format for database
+                            page_number=selected_page,
+                            bbox_number=st.session_state.bbox_num,
+                            text_with_error=selected_bbox_text,
+                            ground_truth=ground_truth,
+                            error_type=error_type
+                        )
+                        st.success("Erro submetido com sucesso!")
+                        st.rerun()
 
-if page_errors:
-    # Display errors with delete buttons
-    for idx, err in enumerate(page_errors):
-        col1, col2 = st.columns([10, 1])
-        
-        with col1:
-            st.markdown(f"**Box #{err['bbox_number']}** - {err['error_type']}")
-            st.markdown(f"**Text with Error:** {err['text_with_error'][:100]}{'...' if len(err['text_with_error']) > 100 else ''}")
-            st.markdown(f"**Ground Truth:** {err['ground_truth'][:100]}{'...' if len(err['ground_truth']) > 100 else ''}")
-        
-        with col2:
-            if st.button("🗑️", key=f"delete_{err['id']}", help="Delete this error"):
-                delete_error(err['id'])
-                st.success("Error deleted!")
-                st.rerun()
-        
-        if idx < len(page_errors) - 1:
-            st.divider()
+    # Show existing errors for this document/page (outside columns)
+    st.divider()
+    st.subheader("Erros Existentes")
+
+    # Database stores document_name as year (e.g., "1939"), not full document name
+    errors = get_errors(document_name_db)
+    page_errors = [e for e in errors if e['page_number'] == selected_page]
+
+    if page_errors:
+        # Display errors with delete buttons
+        for idx, err in enumerate(page_errors):
+            col1, col2 = st.columns([10, 1])
+            
+            with col1:
+                error_type_pt = config.ERROR_TYPE_LABELS.get(err['error_type'], err['error_type'])
+                st.markdown(f"**Caixa #{err['bbox_number']}** - {error_type_pt}")
+                st.markdown(f"**Texto com Erro:** {err['text_with_error'][:100]}{'...' if len(err['text_with_error']) > 100 else ''}")
+                st.markdown(f"**Texto Correto:** {err['ground_truth'][:100]}{'...' if len(err['ground_truth']) > 100 else ''}")
+            
+            with col2:
+                if st.button("🗑️", key=f"delete_{err['id']}", help="Eliminar este erro"):
+                    delete_error(err['id'])
+                    st.success("Erro eliminado!")
+                    st.rerun()
+            
+            if idx < len(page_errors) - 1:
+                st.divider()
     else:
-        st.info("No errors submitted for this page yet.")
+        st.info("Ainda não foram submetidos erros para esta página.")
 
-# Statistics tab
-with tab2:
-    st.header("Annotation Statistics")
+# Statistics view
+elif st.session_state.current_view == "estatisticas":
+    st.header("Estatísticas de Anotação")
     
     # Get all errors
     all_errors = get_errors()
     
     if not all_errors:
-        st.info("No annotations recorded yet.")
+        st.info("Ainda não existem anotações registadas.")
     else:
         # Overall statistics
         col1, col2, col3, col4 = st.columns(4)
@@ -391,16 +676,16 @@ with tab2:
         unique_documents = len(set(e['document_name'] for e in all_errors))
         
         with col1:
-            st.metric("Total Errors", total_errors)
+            st.metric("Total de Erros", total_errors)
         with col2:
-            st.metric("Minor Errors", minor_errors)
+            st.metric("Erros Menores", minor_errors)
         with col3:
-            st.metric("Major Errors", major_errors)
+            st.metric("Erros Maiores", major_errors)
         with col4:
-            st.metric("Documents", unique_documents)
+            st.metric("Documentos", unique_documents)
         
         # Calculate word error statistics
-        with st.spinner("Calculating word error statistics..."):
+        with st.spinner("A calcular estatísticas de erros de palavras..."):
             # Get unique document names that have errors
             documents_with_errors = set(error['document_name'] for error in all_errors)
             
@@ -417,7 +702,7 @@ with tab2:
                                 for bbox, text in bboxes:
                                     total_ocr_words += count_words(text)
                         except Exception as e:
-                            st.warning(f"Could not parse {doc_name}: {e}")
+                            st.warning(f"Não foi possível processar {doc_name}: {e}")
             
             # Count error words
             minor_error_words = 0
@@ -441,25 +726,25 @@ with tab2:
             total_error_pct = (total_error_words / total_ocr_words * 100) if total_ocr_words > 0 else 0
         
         # Word error statistics section
-        st.subheader("Word Error Statistics")
+        st.subheader("Estatísticas de Erros de Palavras")
         col1, col2, col3, col4, col5 = st.columns(5)
         
         with col1:
-            st.metric("Total OCR Words", f"{total_ocr_words:,}")
+            st.metric("Total de Palavras OCR", f"{total_ocr_words:,}")
         with col2:
-            st.metric("Total Error Words", f"{total_error_words:,}", f"{total_error_pct:.3f}%")
+            st.metric("Total de Palavras com Erro", f"{total_error_words:,}", f"{total_error_pct:.3f}%")
         with col3:
-            st.metric("Minor Error Words", f"{minor_error_words:,}", f"{minor_error_pct:.3f}%")
+            st.metric("Palavras com Erro Menor", f"{minor_error_words:,}", f"{minor_error_pct:.3f}%")
         with col4:
-            st.metric("Major Error Words", f"{major_error_words:,}", f"{major_error_pct:.3f}%")
+            st.metric("Palavras com Erro Maior", f"{major_error_words:,}", f"{major_error_pct:.3f}%")
         with col5:
             accuracy = (1 - total_error_pct / 100) * 100 if total_ocr_words > 0 else 100
-            st.metric("Accuracy", f"{accuracy:.3f}%")
+            st.metric("Precisão", f"{accuracy:.3f}%")
         
         st.divider()
         
         # Errors by document
-        st.subheader("Errors by Document")
+        st.subheader("Erros por Documento")
         doc_stats = {}
         for error in all_errors:
             doc_name = error['document_name']
@@ -471,19 +756,19 @@ with tab2:
         # Display as table
         doc_df = pd.DataFrame([
             {
-                'Document': doc,
+                'Documento': doc,
                 'Total': stats['total'],
-                'Minor': stats['minor'],
-                'Major': stats['major']
+                'Menores': stats['minor'],
+                'Maiores': stats['major']
             }
             for doc, stats in sorted(doc_stats.items())
         ])
-        st.dataframe(doc_df, use_container_width=True, hide_index=True)
+        st.dataframe(doc_df, width='stretch', hide_index=True)
         
         st.divider()
         
         # Errors per page for selected document
-        st.subheader(f"Errors per Page - {selected_dir.name}")
+        st.subheader(f"Erros por Página - {selected_dir.name}")
         doc_errors = [e for e in all_errors if e['document_name'] == selected_dir.name]
         
         if doc_errors:
@@ -497,31 +782,31 @@ with tab2:
             
             page_df = pd.DataFrame([
                 {
-                    'Page': page,
+                    'Página': page,
                     'Total': stats['total'],
-                    'Minor': stats['minor'],
-                    'Major': stats['major']
+                    'Menores': stats['minor'],
+                    'Maiores': stats['major']
                 }
                 for page, stats in sorted(page_stats.items())
             ])
-            st.dataframe(page_df, use_container_width=True, hide_index=True)
+            st.dataframe(page_df, width='stretch', hide_index=True)
             
             # Bar chart of errors per page
             if len(page_df) > 0:
-                st.subheader("Errors per Page (Chart)")
-                st.bar_chart(page_df.set_index('Page')[['Minor', 'Major']], height=400)
+                st.subheader("Erros por Página (Gráfico)")
+                st.bar_chart(page_df.set_index('Página')[['Menores', 'Maiores']], height=400)
         else:
-            st.info(f"No errors recorded for document {selected_dir.name} yet.")
+            st.info(f"Ainda não existem erros registados para o documento {selected_dir.name}.")
         
         st.divider()
         
         # Recent errors
-        st.subheader("Recent Errors")
+        st.subheader("Erros Recentes")
         recent_errors = sorted(all_errors, key=lambda x: x['created_at'], reverse=True)[:10]
         
         for error in recent_errors:
-            with st.expander(f"{error['document_name']} - Page {error['page_number']}, Box {error['bbox_number']} ({error['error_type']})"):
-                st.write(f"**Text with Error:** {error['text_with_error'][:200]}{'...' if len(error['text_with_error']) > 200 else ''}")
-                st.write(f"**Ground Truth:** {error['ground_truth'][:200]}{'...' if len(error['ground_truth']) > 200 else ''}")
-                st.caption(f"Submitted: {error['created_at']}")
-
+            error_type_pt = config.ERROR_TYPE_LABELS.get(error['error_type'], error['error_type']).lower()
+            with st.expander(f"{error['document_name']} - Página {error['page_number']}, Caixa {error['bbox_number']} ({error_type_pt})"):
+                st.write(f"**Texto com Erro:** {error['text_with_error'][:200]}{'...' if len(error['text_with_error']) > 200 else ''}")
+                st.write(f"**Texto Correto:** {error['ground_truth'][:200]}{'...' if len(error['ground_truth']) > 200 else ''}")
+                st.caption(f"Submetido: {error['created_at']}")
